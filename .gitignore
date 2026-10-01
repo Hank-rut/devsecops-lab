@@ -3,3 +3,6 @@
 *.tfvars
 key.json
 .env
+*.zip
+LICENSE.txt
+ansible/inventory.ini
