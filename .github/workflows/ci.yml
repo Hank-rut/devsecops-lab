@@ -1,0 +1,66 @@
+name: DevSecOps Pipeline
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+  packages: write
+  security-events: write
+
+jobs:
+  scan-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }   # полная история нужна Gitleaks для сканирования всех коммитов
+
+      - name: Вычислить имя образа (в нижнем регистре)
+        run: echo "IMAGE=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
+
+      - name: Gitleaks — поиск секретов в коде
+        uses: gitleaks/gitleaks-action@v2
+        env: { GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}" }
+
+      - name: Semgrep — статический анализ (SAST)
+        run: |
+          pip install semgrep
+          semgrep --config p/python --error app/
+
+      - name: Сборка Docker-образа
+        run: docker build -t "$IMAGE:${{ github.sha }}" ./app
+
+      - name: Trivy — сканирование образа на уязвимости
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "${{ env.IMAGE }}:${{ github.sha }}"
+          severity: "CRITICAL,HIGH"
+          exit-code: "1"
+          ignore-unfixed: true
+
+      - name: Push в GitHub Container Registry
+        if: github.ref == 'refs/heads/main'
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker push "$IMAGE:${{ github.sha }}"
+
+  deploy:
+    needs: scan-and-build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Вычислить имя образа (в нижнем регистре)
+        run: echo "IMAGE=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
+
+      - uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VM_HOST }}
+          username: ubuntu
+          key: ${{ secrets.SSH_KEY }}
+          script: |
+            docker network create labnet 2>/dev/null || true
+            echo "${{ secrets.GHCR_PAT }}" | docker login ghcr.io -u "${{ secrets.GHCR_USER }}" --password-stdin
+            docker pull ${{ env.IMAGE }}:${{ github.sha }}
+            docker rm -f app || true
+            docker run -d --name app --restart unless-stopped --network labnet -p 80:8000 ${{ env.IMAGE }}:${{ github.sha }}
